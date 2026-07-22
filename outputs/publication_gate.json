@@ -33,10 +33,12 @@
   },
   "paper": "DsV89lJ58l",
   "pass": true,
+  "publication_gate_passed": true,
   "source_summary": {
     "full_algorithm_mean_error": 0.653189,
     "ols_mean_error": 9.852682,
     "true_set_mean_error": 0.522706,
     "wrong_set_mean_error": 7.17076
-  }
+  },
+  "tests_passed": true
 }

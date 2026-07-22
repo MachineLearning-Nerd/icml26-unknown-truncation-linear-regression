@@ -20,6 +20,18 @@ def check(condition: bool, message: str, failures: list[str]) -> None:
 
 def main() -> None:
     failures: list[str] = []
+    tests_passed = False
+    try:
+        subprocess.run(
+            [str(ROOT / ".venv" / "bin" / "python"), "-m", "pytest", "-q", "repro/tests"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        tests_passed = True
+    except (OSError, subprocess.CalledProcessError) as error:
+        failures.append(f"claim verifier tests failed: {error}")
     try:
         commit = subprocess.check_output(
             ["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"], text=True
@@ -73,6 +85,8 @@ def main() -> None:
     report = {
         "paper": "DsV89lJ58l",
         "pass": not failures,
+        "tests_passed": tests_passed,
+        "publication_gate_passed": not failures,
         "author_commit": commit,
         "author_dirty": bool(dirty),
         "full_scale": {"reruns": 10, "psgd_iterations": 4500, "plot": str(plot.relative_to(ROOT))},

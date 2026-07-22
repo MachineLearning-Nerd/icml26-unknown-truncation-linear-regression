@@ -28,3 +28,5 @@ Next: execute `repro/src/run_publication_gate.py`, perform the secret scan,
 initialize/push the public GitHub repository, then atomically enqueue only if
 the local gate remains affirmative. The first independent-control attempt is
 retained in Trackio as a failed, too-weak negative control and is not evidence.
+
+FULL_GATE_READY: DsV89lJ58l
