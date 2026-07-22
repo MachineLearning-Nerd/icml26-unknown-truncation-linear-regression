@@ -1,0 +1,1264 @@
+# Source replication — paper-scale
+
+
+---
+<!-- trackio-cell
+{"type": "code", "id": "cell_c67f8175c5d2", "created_at": "2026-07-22T11:45:30+00:00", "title": "Run: env main.py (exit 0)", "command": ["env", "MPLBACKEND=Agg", "OPENBLAS_NUM_THREADS=1", "OMP_NUM_THREADS=1", "MKL_NUM_THREADS=1", ".venv/bin/python", "upstream/main.py", "--config", "upstream/config.yaml", "--R", "10", "--output-plot", "outputs/source_r10.png"], "exit_code": 0, "duration_s": 1455.32}
+-->
+````bash
+$ env MPLBACKEND=Agg OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python upstream/main.py --config upstream/config.yaml --R 10 --output-plot outputs/source_r10.png
+````
+
+exit 0 · 1455.3s
+
+
+````python title=main.py
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import argparse
+import math
+import warnings
+from collections import OrderedDict, Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import yaml
+from scipy.stats import norm
+
+warnings.filterwarnings(
+    "ignore",
+    category=SyntaxWarning,
+    message=r".*invalid escape sequence.*",
+)
+
+Interval = Tuple[float, float]
+ALL_METHODS: Tuple[str, ...] = ("ols", "wrong_set", "true_set", "full")
+METHOD_LABELS: Dict[str, str] = {
+    "ols": "OLS (no correction)",
+    "wrong_set": "PSGD with wrong S",
+    "true_set": "PSGD with true S*",
+    "full": "Full algorithm",
+}
+
+def normalize_intervals(intervals: Sequence[Interval]) -> List[Interval]:
+    # Sorts sequence of intervals, removing any invalid ones
+    cleaned = sorted((float(a), float(b)) for a, b in intervals if a <= b)
+    if not cleaned:
+        return []
+    merged: List[Interval] = [cleaned[0]]
+    for a, b in cleaned[1:]:
+        prev_a, prev_b = merged[-1]
+        if a <= prev_b:
+            merged[-1] = (prev_a, max(prev_b, b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def shift_intervals(intervals: Sequence[Interval], shift: float) -> List[Interval]:
+    return normalize_intervals([(a + shift, b + shift) for a, b in intervals])
+
+
+def in_intervals(y: np.ndarray | float, intervals: Sequence[Interval]) -> np.ndarray:
+    y_arr = np.asarray(y)
+    mask = np.zeros_like(y_arr, dtype=bool)
+    for a, b in intervals:
+        mask |= (a <= y_arr) & (y_arr <= b)
+    return mask
+
+
+def truncated_gaussian_normalization(
+    intervals: Sequence[Interval],
+    loc: np.ndarray | float,
+    scale: float = 1.0,
+    eps: float = 1e-15,
+) -> np.ndarray | float:
+    loc_arr = np.asarray(loc, dtype=float)
+    mass = np.zeros_like(loc_arr, dtype=float)
+    for a, b in normalize_intervals(intervals):
+        mass += norm.cdf((b - loc_arr) / scale) - norm.cdf((a - loc_arr) / scale)
+    mass = np.maximum(mass, eps)
+    if np.ndim(loc) == 0:
+        return float(mass)
+    return mass
+
+
+def truncated_gaussian_mean(
+    intervals: Sequence[Interval],
+    loc: np.ndarray | float,
+    scale: float = 1.0,
+    eps: float = 1e-15,
+) -> np.ndarray | float:
+    """Exact E[Z | Z in S] for Z ~ N(loc, scale^2)."""
+    loc_arr = np.asarray(loc, dtype=float)
+    denom = truncated_gaussian_normalization(intervals, loc_arr, scale=scale, eps=eps)
+    numer = np.zeros_like(loc_arr, dtype=float)
+    for a, b in normalize_intervals(intervals):
+        alpha = (a - loc_arr) / scale
+        beta = (b - loc_arr) / scale
+        numer += norm.pdf(alpha) - norm.pdf(beta)
+    out = loc_arr + scale * numer / denom
+    if np.ndim(loc) == 0:
+        return float(out)
+    return out
+
+
+def truncated_gaussian_sampler(
+    rng: np.random.Generator,
+    intervals: Sequence[Interval],
+    loc: float,
+    scale: float = 1.0,
+) -> float:
+    """Correct multi-interval truncated Gaussian sampler."""
+    intervals = normalize_intervals(intervals)
+    masses = []
+    for a, b in intervals:
+        mass = norm.cdf((b - loc) / scale) - norm.cdf((a - loc) / scale)
+        masses.append(max(mass, 0.0))
+    masses = np.asarray(masses, dtype=float)
+    total_mass = masses.sum()
+    if total_mass <= 0:
+        raise ValueError("Truncated Gaussian has essentially zero mass on the supplied intervals.")
+    interval_idx = int(rng.choice(len(intervals), p=masses / total_mass))
+    a, b = intervals[interval_idx]
+    cdf_a = norm.cdf((a - loc) / scale)
+    cdf_b = norm.cdf((b - loc) / scale)
+    u = np.clip(rng.uniform(cdf_a, cdf_b), 1e-15, 1 - 1e-15)
+    return float(loc + scale * norm.ppf(u))
+
+
+@dataclass
+class TruncatedRegressionProblem:
+    w_star: np.ndarray
+    truncation_intervals: List[Interval]
+    feature_weights: np.ndarray
+    feature_means: np.ndarray
+    feature_covariance: np.ndarray
+    noise_std: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.w_star = np.asarray(self.w_star, dtype=float)
+        self.feature_covariance = np.asarray(self.feature_covariance, dtype=float)
+        self.truncation_intervals = normalize_intervals(self.truncation_intervals)
+        if any([mean.shape != self.w_star.shape for mean in self.feature_means]):
+            raise ValueError("Dimensions of elements of feature_means must match w_star dimension")
+        if len(self.feature_weights) != len(self.feature_means):
+            print(self.feature_means)
+            raise ValueError("Number of elements of feature_weights must match feature_means")
+        if self.feature_weights.sum() != 1.0:
+            raise ValueError("feature_weights must sum to 1")
+        if self.feature_covariance.shape[0] != self.feature_covariance.shape[1]:
+            raise ValueError("feature_covariance must be square.")
+        if self.feature_covariance.shape[0] != self.w_star.shape[0]:
+            raise ValueError("feature_covariance dimension must match w_star dimension.")
+        if self.noise_std <= 0:
+            raise ValueError("noise_std must be positive.")
+        self._cov_chol = np.linalg.cholesky(self.feature_covariance)
+
+    @property
+    def d(self) -> int:
+        return int(self.w_star.shape[0])
+
+    def make_simulator(self, seed: int) -> "TruncatedRegressionSimulator":
+        return TruncatedRegressionSimulator(problem=self, seed=seed)
+
+
+class TruncatedRegressionSimulator:
+    def __init__(self, problem: TruncatedRegressionProblem, seed: int) -> None:
+        self.problem = problem
+        self.seed = int(seed)
+        self.rng = np.random.default_rng(self.seed)
+
+    def sample_features(self, n_samples: int) -> np.ndarray:
+        idx_arr = self.rng.choice(
+            len(self.problem.feature_means), 
+            p=self.problem.feature_weights, 
+            size=n_samples
+        )
+        loc_counter = Counter(idx_arr)
+        samples_list = []
+        for idx, count in loc_counter.items():
+            samples_list.append(
+                self.rng.normal(
+                    loc=self.problem.feature_means[idx], 
+                    size=(count, self.problem.d)
+                )
+            )
+        return np.concatenate(samples_list, axis=0) @ self.problem._cov_chol.T
+
+    def sample_truncated(self, n_samples: int = 1) -> Tuple[np.ndarray, np.ndarray]:
+        X_list: List[np.ndarray] = []
+        y_list: List[np.ndarray] = []
+        n_survived = 0
+        while n_survived < n_samples:
+            remaining = n_samples - n_survived
+            n_generated = min(max(10 * remaining, 1_000), 100_000)
+            X = self.sample_features(n_generated)
+            y = X @ self.problem.w_star + self.problem.noise_std * self.rng.normal(size=n_generated)
+            mask = in_intervals(y, self.problem.truncation_intervals)
+            if np.any(mask):
+                X_list.append(X[mask])
+                y_list.append(y[mask])
+                n_survived += int(mask.sum())
+        X_sampled = np.concatenate(X_list, axis=0)[:n_samples]
+        y_sampled = np.concatenate(y_list, axis=0)[:n_samples]
+        return X_sampled, y_sampled
+
+    def estimate_survival_probability(self, n_samples: int = 200_000) -> float:
+        X = self.sample_features(n_samples)
+        y = X @ self.problem.w_star + self.problem.noise_std * self.rng.normal(size=n_samples)
+        return float(in_intervals(y, self.problem.truncation_intervals).mean())
+
+    def find_warm_start(self, n_samples: int = 5_000, ridge: float = 1e-8) -> np.ndarray:
+        """OLS warm start with solve(...) instead of an explicit inverse."""
+        X, y = self.sample_truncated(n_samples)
+        gram = X.T @ X
+        rhs = X.T @ y
+        try:
+            return np.linalg.solve(gram, rhs)
+        except np.linalg.LinAlgError:
+            return np.linalg.solve(gram + ridge * np.eye(gram.shape[0]), rhs)
+
+    def learn_truncation_set(
+        self,
+        w_hat: np.ndarray,
+        k: int,
+        n_samples: int = 5_000,
+        r: Optional[int] = None,
+        r_scale: float = 1.0,
+        max_removed_gaps: Optional[int] = None,
+        min_interval_width: float = 1e-8,
+    ) -> List[Interval]:
+        """Approximate set learning via gap counting."""
+        _, y_pos = self.sample_truncated(n_samples)
+        y_pos = np.sort(np.asarray(y_pos, dtype=float))
+        X_obs, _ = self.sample_truncated(n_samples)
+        y_aux = X_obs @ np.asarray(w_hat, dtype=float) + self.problem.noise_std * self.rng.normal(
+            size=n_samples
+        )
+        y_aux = np.sort(np.asarray(y_aux, dtype=float))
+        if len(y_pos) == 0:
+            raise ValueError("No positive samples were observed while learning the truncation set.")
+        if len(y_pos) == 1:
+            value = float(y_pos[0])
+            return [(value, value)]
+        if k <= 1:
+            return [(float(y_pos[0]), float(y_pos[-1]))]
+        left = np.searchsorted(y_aux, y_pos[:-1], side="right")
+        right = np.searchsorted(y_aux, y_pos[1:], side="left")
+        gap_counts = right - left
+        if r is None:
+            r = int(round(r_scale * (k - 1) * math.sqrt(n_samples / max(k, 1))))
+            r = max(k - 1, r)
+        if max_removed_gaps is not None:
+            r = min(r, max_removed_gaps)
+        r = min(r, len(gap_counts))
+        if r <= 0:
+            return [(float(y_pos[0]), float(y_pos[-1]))]
+        remove_mask = np.zeros(len(gap_counts), dtype=bool)
+        largest = np.argpartition(gap_counts, -r)[-r:]
+        remove_mask[largest] = True
+        intervals: List[Interval] = []
+        start = float(y_pos[0])
+        for i, remove_gap in enumerate(remove_mask):
+            if remove_gap:
+                end = float(y_pos[i])
+                if end - start > min_interval_width:
+                    intervals.append((start, end))
+                start = float(y_pos[i + 1])
+        end = float(y_pos[-1])
+        if end - start > min_interval_width:
+            intervals.append((start, end))
+        intervals = normalize_intervals(intervals)
+        if not intervals:
+            intervals = [(float(y_pos[0]), float(y_pos[-1]))]
+        return intervals
+
+    def gradient_sampler(
+        self,
+        w: np.ndarray,
+        intervals: Sequence[Interval],
+        batch_size: int = 64,
+        use_conditional_mean: bool = True,
+    ) -> np.ndarray:
+        """Minibatched gradient estimate for the perturbed objective."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        X_hat, y_hat = self.sample_truncated(batch_size)
+        X_tilde, _ = self.sample_truncated(batch_size)
+        mu_tilde = X_tilde @ np.asarray(w, dtype=float)
+        if use_conditional_mean:
+            z_tilde = np.asarray(
+                truncated_gaussian_mean(intervals, mu_tilde, scale=self.problem.noise_std),
+                dtype=float,
+            )
+        else:
+            z_tilde = np.array(
+                [
+                    truncated_gaussian_sampler(
+                        self.rng,
+                        intervals,
+                        loc=float(mu),
+                        scale=self.problem.noise_std,
+                    )
+                    for mu in mu_tilde
+                ],
+                dtype=float,
+            )
+        grads = z_tilde[:, None] * X_tilde - y_hat[:, None] * X_hat
+        return grads.mean(axis=0)
+
+    def psgd(
+        self,
+        w_init: np.ndarray,
+        intervals: Sequence[Interval],
+        config: "PSGDConfig",
+        reference_w: Optional[np.ndarray] = None,
+        verbose_label: str = "",
+    ) -> "PSGDTrace":
+        """Projected SGD returning the **last iterate**."""
+        if config.radius <= 0:
+            raise ValueError("radius must be positive.")
+        if config.T <= 0:
+            raise ValueError("T must be positive.")
+        w = np.asarray(w_init, dtype=float).copy()
+        center = np.asarray(w_init, dtype=float).copy()
+        ref = None if reference_w is None else np.asarray(reference_w, dtype=float)
+        errors = None if ref is None else np.empty(config.T + 1, dtype=float)
+        if errors is not None:
+            errors[0] = np.linalg.norm(w - ref)
+        step_sizes = np.empty(config.T, dtype=float)
+        grad_norms = np.empty(config.T, dtype=float)
+        projection_hit_rates = np.empty(config.T, dtype=float)
+        projection_hits = 0
+        for t in range(1, config.T + 1):
+            eta = config.step_size_at(t)
+            grad = self.gradient_sampler(
+                w,
+                intervals,
+                batch_size=config.batch_size,
+                use_conditional_mean=config.use_conditional_mean,
+            )
+            grad_norm = float(np.linalg.norm(grad))
+            if config.grad_clip is not None and grad_norm > config.grad_clip and grad_norm > 0:
+                grad = grad * (config.grad_clip / grad_norm)
+            w = w - eta * grad
+            diff = w - center
+            diff_norm = float(np.linalg.norm(diff))
+            if diff_norm > config.radius:
+                projection_hits += 1
+                w = center + (config.radius / diff_norm) * diff
+            step_sizes[t - 1] = eta
+            grad_norms[t - 1] = grad_norm
+            projection_hit_rates[t - 1] = projection_hits / t
+            if errors is not None:
+                errors[t] = np.linalg.norm(w - ref)
+            if config.verbose_every and t % config.verbose_every == 0:
+                prefix = f"[{verbose_label}] " if verbose_label else ""
+                status = (
+                    f"{prefix}t={t:6d} | eta={eta:.4g} | grad_norm={grad_norm:.4f} | "
+                    f"proj_hit_rate={projection_hits / t:.3f}"
+                )
+                if errors is not None:
+                    status += f" | error={errors[t]:.6f}"
+                print(status)
+        return PSGDTrace(
+            w_last=w,
+            error_trajectory=errors,
+            step_sizes=step_sizes,
+            grad_norms=grad_norms,
+            projection_hit_rate_trajectory=projection_hit_rates,
+        )
+
+
+@dataclass
+class PSGDConfig:
+    radius: float = 1.5
+    T: int = 1_000
+    batch_size: int = 64
+    step0: float = 0.05
+    step_schedule: str = "inverse_sqrt"
+    grad_clip: Optional[float] = 10.0
+    use_conditional_mean: bool = True
+    verbose_every: int = 0
+
+    def step_size_at(self, t: int) -> float:
+        if self.step_schedule == "inverse_time":
+            return self.step0 / t
+        if self.step_schedule == "inverse_sqrt":
+            return self.step0 / math.sqrt(t)
+        raise ValueError("step_schedule must be 'inverse_time' or 'inverse_sqrt'.")
+
+
+@dataclass
+class WarmStartConfig:
+    n_samples: int = 5_000
+    ridge: float = 1e-8
+
+
+@dataclass
+class SetLearningConfig:
+    n_samples: int = 5_000
+    r: Optional[int] = None
+    r_scale: float = 1.0
+    max_removed_gaps: Optional[int] = None
+    min_interval_width: float = 1e-8
+
+
+@dataclass
+class ExperimentSetup:
+    problem: TruncatedRegressionProblem
+    wrong_intervals: List[Interval]
+    warm_start: WarmStartConfig = field(default_factory=WarmStartConfig)
+    set_learning: SetLearningConfig = field(default_factory=SetLearningConfig)
+    psgd: PSGDConfig = field(default_factory=PSGDConfig)
+
+    def __post_init__(self) -> None:
+        self.wrong_intervals = normalize_intervals(self.wrong_intervals)
+
+
+@dataclass
+class PSGDTrace:
+    w_last: np.ndarray
+    error_trajectory: Optional[np.ndarray]
+    step_sizes: np.ndarray
+    grad_norms: np.ndarray
+    projection_hit_rate_trajectory: np.ndarray
+
+
+@dataclass
+class MethodRun:
+    method: str
+    final_w: np.ndarray
+    error_trajectory: np.ndarray
+    intervals_used: Optional[List[Interval]]
+    step_sizes: Optional[np.ndarray] = None
+    grad_norms: Optional[np.ndarray] = None
+    projection_hit_rate_trajectory: Optional[np.ndarray] = None
+
+    @property
+    def final_error(self) -> float:
+        return float(self.error_trajectory[-1])
+
+
+@dataclass
+class SingleRunResult:
+    seed: int
+    w_hat: np.ndarray
+    learned_intervals: Optional[List[Interval]]
+    method_runs: "OrderedDict[str, MethodRun]"
+
+
+@dataclass
+class TrajectoryStats:
+    mean: np.ndarray
+    std: np.ndarray
+
+    @property
+    def final_mean(self) -> float:
+        return float(self.mean[-1])
+
+    @property
+    def final_std(self) -> float:
+        return float(self.std[-1])
+
+
+@dataclass
+class ComparisonResult:
+    setup: ExperimentSetup
+    methods: Tuple[str, ...]
+    runs: List[SingleRunResult]
+    trajectory_stats: Dict[str, TrajectoryStats]
+
+
+def validate_methods(methods: Iterable[str]) -> Tuple[str, ...]:
+    unique = []
+    for method in methods:
+        if method not in ALL_METHODS:
+            raise ValueError(f"Unknown method '{method}'. Available methods: {ALL_METHODS}")
+        if method not in unique:
+            unique.append(method)
+    if not unique:
+        raise ValueError("At least one method must be selected.")
+    return tuple(unique)
+
+
+def build_constant_method_run(
+    method: str,
+    w_hat: np.ndarray,
+    reference_w: np.ndarray,
+    T: int,
+) -> MethodRun:
+    """OLS has no iterations, so we plot it as a constant error line."""
+    error = float(np.linalg.norm(w_hat - reference_w))
+    trajectory = np.full(T + 1, error, dtype=float)
+    return MethodRun(
+        method=method,
+        final_w=np.asarray(w_hat, dtype=float).copy(),
+        error_trajectory=trajectory,
+        intervals_used=None,
+    )
+
+
+def run_psgd_method(
+    setup: ExperimentSetup,
+    method: str,
+    w_hat: np.ndarray,
+    intervals: Sequence[Interval],
+    psgd_seed: int,
+) -> MethodRun:
+    """Run one PSGD-based method from the common warm start."""
+    sim = setup.problem.make_simulator(psgd_seed)
+    trace = sim.psgd(
+        w_init=w_hat,
+        intervals=intervals,
+        config=setup.psgd,
+        reference_w=setup.problem.w_star,
+        verbose_label=METHOD_LABELS[method],
+    )
+    if trace.error_trajectory is None:
+        raise RuntimeError("Simulation comparison requires a reference parameter w*.")
+    return MethodRun(
+        method=method,
+        final_w=trace.w_last,
+        error_trajectory=trace.error_trajectory,
+        intervals_used=list(normalize_intervals(intervals)),
+        step_sizes=trace.step_sizes,
+        grad_norms=trace.grad_norms,
+        projection_hit_rate_trajectory=trace.projection_hit_rate_trajectory,
+    )
+
+
+def run_single_replication(
+    setup: ExperimentSetup,
+    seed: int,
+    methods: Iterable[str] = ALL_METHODS,
+) -> SingleRunResult:
+    """Run one replicate. All PSGD methods share the same warm start."""
+    methods = validate_methods(methods)
+    method_runs: "OrderedDict[str, MethodRun]" = OrderedDict()
+    warm_seed = int(seed)
+    set_seed = int(seed) + 1
+    psgd_seed = int(seed) + 2
+
+    warm_sim = setup.problem.make_simulator(warm_seed)
+    w_hat = warm_sim.find_warm_start(
+        n_samples=setup.warm_start.n_samples,
+        ridge=setup.warm_start.ridge,
+    )
+
+    learned_intervals: Optional[List[Interval]] = None
+    if "full" in methods:
+        set_sim = setup.problem.make_simulator(set_seed)
+        learned_intervals = set_sim.learn_truncation_set(
+            w_hat,
+            k=len(setup.problem.truncation_intervals),
+            n_samples=setup.set_learning.n_samples,
+            r=setup.set_learning.r,
+            r_scale=setup.set_learning.r_scale,
+            max_removed_gaps=setup.set_learning.max_removed_gaps,
+            min_interval_width=setup.set_learning.min_interval_width,
+        )
+
+    for method in methods:
+        if method == "ols":
+            method_runs[method] = build_constant_method_run(
+                method=method,
+                w_hat=w_hat,
+                reference_w=setup.problem.w_star,
+                T=setup.psgd.T,
+            )
+        elif method == "wrong_set":
+            method_runs[method] = run_psgd_method(
+                setup=setup,
+                method=method,
+                w_hat=w_hat,
+                intervals=setup.wrong_intervals,
+                psgd_seed=psgd_seed,
+            )
+        elif method == "true_set":
+            method_runs[method] = run_psgd_method(
+                setup=setup,
+                method=method,
+                w_hat=w_hat,
+                intervals=setup.problem.truncation_intervals,
+                psgd_seed=psgd_seed,
+            )
+        elif method == "full":
+            if learned_intervals is None:
+                raise RuntimeError("learned_intervals should have been computed for the full method.")
+            method_runs[method] = run_psgd_method(
+                setup=setup,
+                method=method,
+                w_hat=w_hat,
+                intervals=learned_intervals,
+                psgd_seed=psgd_seed,
+            )
+        else:
+            raise ValueError(f"Unexpected method '{method}'.")
+    return SingleRunResult(
+        seed=int(seed),
+        w_hat=w_hat,
+        learned_intervals=learned_intervals,
+        method_runs=method_runs,
+    )
+
+
+def run_repeated_experiment(
+    setup: ExperimentSetup,
+    R: int = 1,
+    methods: Iterable[str] = ALL_METHODS,
+    base_seed: int = 0,
+) -> ComparisonResult:
+    if R <= 0:
+        raise ValueError("R must be positive.")
+    methods = validate_methods(methods)
+    runs: List[SingleRunResult] = []
+    for r in range(R):
+        seed = base_seed + 10_000 * r
+        runs.append(run_single_replication(setup=setup, seed=seed, methods=methods))
+    trajectory_stats: Dict[str, TrajectoryStats] = {}
+    for method in methods:
+        stacked = np.stack([run.method_runs[method].error_trajectory for run in runs], axis=0)
+        trajectory_stats[method] = TrajectoryStats(
+            mean=stacked.mean(axis=0),
+            std=stacked.std(axis=0),
+        )
+    return ComparisonResult(
+        setup=setup,
+        methods=methods,
+        runs=runs,
+        trajectory_stats=trajectory_stats,
+    )
+
+def plot_comparison(
+    result: ComparisonResult,
+    output_path: Optional[str | Path] = None,
+    show_std: bool = True,
+    title: Optional[str] = None,
+) -> Tuple[plt.Figure, plt.Axes]:
+    palatino_rc = {
+        # Tries Palatino first; falls back automatically if unavailable.
+        "font.family": "serif",
+        "font.serif": [
+            "Palatino",
+            "Palatino Linotype",
+            "Book Antiqua",
+            "URW Palladio L",
+            "DejaVu Serif",
+        ],
+        "mathtext.fontset": "stix",
+    }
+
+    TITLE_SIZE = 22
+    LABEL_SIZE = 20
+    LEGEND_SIZE = 16
+    TICK_SIZE = 16
+    LINE_WIDTH = 4
+
+    # Give every line a distinct style so the plot is readable even in grayscale.
+    style_by_label = {
+        "OLS (no correction)": dict(linestyle=":", linewidth=LINE_WIDTH),
+        "PSGD with wrong $S$": dict(linestyle="-.", linewidth=LINE_WIDTH),
+        "PSGD with true $S^\star$": dict(linestyle="-", linewidth=LINE_WIDTH),
+        "Full algorithm": dict(linestyle='--', linewidth=LINE_WIDTH),
+    }
+    fallback_styles = [
+        dict(linestyle="-", linewidth=LINE_WIDTH),
+        dict(linestyle="--", linewidth=LINE_WIDTH),
+        dict(linestyle="-.", linewidth=LINE_WIDTH),
+        dict(linestyle=":", linewidth=LINE_WIDTH),
+    ]
+
+    with mpl.rc_context(palatino_rc):
+        fig, ax = plt.subplots(figsize=(8.5, 5.5))
+
+        # Fully white background.
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("white")
+        ax.set_axisbelow(True)
+
+        x = np.arange(result.setup.psgd.T + 1)
+
+        for i, method in enumerate(result.methods):
+            stats = result.trajectory_stats[method]
+            label = METHOD_LABELS[method]
+            style = style_by_label.get(label, fallback_styles[i % len(fallback_styles)])
+
+            line, = ax.plot(
+                x,
+                stats.mean,
+                label=label,
+                **style,
+                zorder=3 + i,
+            )
+
+            if show_std and len(result.runs) >= 2:
+                ax.fill_between(
+                    x,
+                    stats.mean - stats.std,
+                    stats.mean + stats.std,
+                    color=line.get_color(),
+                    alpha=0.12,
+                    zorder=1,
+                )
+
+        ax.set_xlabel("Iteration", fontsize=LABEL_SIZE)
+        ax.set_ylabel(r"$\|w_t - w^\star\|_2$", fontsize=LABEL_SIZE)
+        ax.set_title(
+            title or "Truncated regression comparison",
+            fontsize=TITLE_SIZE,
+            pad=14,
+        )
+        ax.tick_params(axis="both", labelsize=TICK_SIZE)
+
+        ax.legend(
+            fontsize=LEGEND_SIZE,
+            loc="best",
+            frameon=True,
+            framealpha=1.0,
+            facecolor="white",
+            edgecolor="black",
+            handlelength=3.0,
+            borderpad=0.8,
+            labelspacing=0.6,
+        )
+
+        ax.grid(True, color="0.85", linewidth=1.0, alpha=1.0)
+        fig.tight_layout()
+
+        if output_path is not None:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(
+                output_path,
+                dpi=800,
+                bbox_inches="tight",
+                facecolor="white",
+            )
+
+        return fig, ax
+
+
+def print_experiment_summary(result: ComparisonResult) -> None:
+    setup = result.setup
+    print("Problem dimension:", setup.problem.d)
+    print("True w*:", np.array2string(setup.problem.w_star, precision=4))
+    print("True truncation set S*:", setup.problem.truncation_intervals)
+    print("Wrong-set baseline uses S:", setup.wrong_intervals)
+    print("Number of outer reruns R:", len(result.runs))
+    print("PSGD iterations T:", setup.psgd.T)
+    surv_sim = setup.problem.make_simulator(seed=987654321)
+    print("Estimated survival probability:", surv_sim.estimate_survival_probability(n_samples=100_000))
+    first_run = result.runs[0]
+    print("Warm-start error ||w_hat - w*|| (run 1):", np.linalg.norm(first_run.w_hat - setup.problem.w_star))
+    if first_run.learned_intervals is not None:
+        print("Learned truncation intervals (run 1):", first_run.learned_intervals)
+    print("\nFinal error summary (mean +/- std across reruns):")
+    for method in result.methods:
+        stats = result.trajectory_stats[method]
+        print(f"  {METHOD_LABELS[method]:25s}: {stats.final_mean:.6f} +/- {stats.final_std:.6f}")
+
+def make_experiment_setup(
+    w_star: np.ndarray,
+    truncation_intervals: Sequence[Interval],
+    feature_weights: np.ndarray,
+    feature_means: np.ndarray,
+    feature_covariance: np.ndarray,
+    noise_std: float = 1.0,
+    wrong_intervals: Sequence[Interval] = [(-1.0, 1.0)],
+    warm_start_samples: int = 5_000,
+    warm_start_ridge: float = 1e-8,
+    set_learning_samples: int = 5_000,
+    set_learning_r: Optional[int] = None,
+    set_learning_r_scale: float = 1.0,
+    set_learning_max_removed_gaps: Optional[int] = None,
+    set_learning_min_interval_width: float = 1e-8,
+    psgd_radius: float = 10.0,
+    psgd_T: int = 4_500,
+    psgd_batch_size: int = 128,
+    psgd_step0: float = 20.0,
+    psgd_step_schedule: str = "inverse_sqrt",
+    psgd_grad_clip: Optional[float] = 10.0,
+    psgd_use_conditional_mean: bool = True,
+    psgd_verbose_every: int = 500
+) -> ExperimentSetup:
+    """Helper function to create an ExperimentSetup with custom parameters."""
+    problem = TruncatedRegressionProblem(
+        w_star=np.asarray(w_star, dtype=float),
+        truncation_intervals=normalize_intervals(truncation_intervals),
+        feature_weights=np.asarray(feature_weights, dtype=float),
+        feature_means=np.asarray(feature_means, dtype=float),
+        feature_covariance=np.asarray(feature_covariance, dtype=float),
+        noise_std=float(noise_std),
+    )
+    return ExperimentSetup(
+        problem=problem,
+        wrong_intervals=normalize_intervals(wrong_intervals),
+        warm_start=WarmStartConfig(n_samples=int(warm_start_samples), ridge=float(warm_start_ridge)),
+        set_learning=SetLearningConfig(
+            n_samples=int(set_learning_samples),
+            r=set_learning_r,
+            r_scale=float(set_learning_r_scale),
+            max_removed_gaps=set_learning_max_removed_gaps,
+            min_interval_width=float(set_learning_min_interval_width),
+        ),
+        psgd=PSGDConfig(
+            radius=float(psgd_radius),
+            T=int(psgd_T),
+            batch_size=int(psgd_batch_size),
+            step0=float(psgd_step0),
+            step_schedule=psgd_step_schedule,
+            grad_clip=psgd_grad_clip,
+            use_conditional_mean=psgd_use_conditional_mean,
+            verbose_every=int(psgd_verbose_every),
+        ),
+    )
+
+
+def make_experiment_setup_from_yaml(config_path: str) -> ExperimentSetup:
+    """Load an experiment setup from a YAML config file and override defaults only where provided."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    setup = make_default_demo_setup()
+    problem_config = config.get("problem", {})
+    warm_start_config = config.get("warm_start", {})
+    set_learning_config = config.get("set_learning", {})
+    psgd_config = config.get("psgd", {})
+
+    problem_kwargs: Dict[str, Any] = {
+        "w_star": setup.problem.w_star,
+        "truncation_intervals": setup.problem.truncation_intervals,
+        "feature_weights": setup.problem.feature_weights,
+        "feature_means": setup.problem.feature_means,
+        "feature_covariance": setup.problem.feature_covariance,
+        "noise_std": setup.problem.noise_std,
+    }
+
+    if "w_star" in problem_config:
+        problem_kwargs["w_star"] = np.asarray(problem_config["w_star"], dtype=float)
+    if "truncation_intervals" in problem_config:
+        problem_kwargs["truncation_intervals"] = normalize_intervals(problem_config["truncation_intervals"])
+    if "feature_weights" in problem_config:
+        problem_kwargs["feature_weights"] = np.asarray(problem_config["feature_weights"], dtype=float)
+    if "feature_means" in problem_config:
+        problem_kwargs["feature_means"] = np.asarray(problem_config["feature_means"], dtype=float)
+    if "feature_covariance" in problem_config:
+        problem_kwargs["feature_covariance"] = np.asarray(problem_config["feature_covariance"], dtype=float)
+    if "noise_std" in problem_config:
+        problem_kwargs["noise_std"] = float(problem_config["noise_std"])
+
+    setup.problem = TruncatedRegressionProblem(**problem_kwargs)
+
+    if "wrong_intervals" in config:
+        setup.wrong_intervals = normalize_intervals(config["wrong_intervals"])
+
+    if "n_samples" in warm_start_config:
+        setup.warm_start.n_samples = int(warm_start_config["n_samples"])
+    if "ridge" in warm_start_config:
+        setup.warm_start.ridge = float(warm_start_config["ridge"])
+
+    if "n_samples" in set_learning_config:
+        setup.set_learning.n_samples = int(set_learning_config["n_samples"])
+    if "r" in set_learning_config:
+        setup.set_learning.r = set_learning_config["r"]
+    if "r_scale" in set_learning_config:
+        setup.set_learning.r_scale = float(set_learning_config["r_scale"])
+    if "max_removed_gaps" in set_learning_config:
+        setup.set_learning.max_removed_gaps = set_learning_config["max_removed_gaps"]
+    if "min_interval_width" in set_learning_config:
+        setup.set_learning.min_interval_width = float(set_learning_config["min_interval_width"])
+
+    if "radius" in psgd_config:
+        setup.psgd.radius = float(psgd_config["radius"])
+    if "T" in psgd_config:
+        setup.psgd.T = int(psgd_config["T"])
+    if "batch_size" in psgd_config:
+        setup.psgd.batch_size = int(psgd_config["batch_size"])
+    if "step0" in psgd_config:
+        setup.psgd.step0 = float(psgd_config["step0"])
+    if "step_schedule" in psgd_config:
+        setup.psgd.step_schedule = str(psgd_config["step_schedule"])
+    if "grad_clip" in psgd_config:
+        setup.psgd.grad_clip = psgd_config["grad_clip"]
+    if "use_conditional_mean" in psgd_config:
+        setup.psgd.use_conditional_mean = bool(psgd_config["use_conditional_mean"])
+    if "verbose_every" in psgd_config:
+        setup.psgd.verbose_every = int(psgd_config["verbose_every"])
+
+    return setup
+
+
+def make_default_demo_setup() -> ExperimentSetup:
+    """Default problem with clearly separated baselines."""
+    return make_experiment_setup(
+        w_star=20 * np.ones(10),
+        truncation_intervals=[(-3.75, -3), (-2.5, -1.5), (-1, 1), (2, 3), (3.25, 4)],
+        feature_weights=np.asarray([0.25, 0.3, 0.15, 0.1, 0.2]),
+        feature_means=np.asarray([
+            np.zeros(10),
+            -0.5 * np.ones(10), 
+            0.5 * np.ones(10),
+            0.5 * np.concatenate([np.ones(5), -np.ones(5)], axis=0),
+            0.5 * np.concatenate([-np.ones(5), np.ones(5)], axis=0)
+        ]),
+        feature_covariance=np.eye(10),
+        noise_std=1.0,
+        wrong_intervals=[(-5.0, 5.0)]
+    )
+
+
+def parse_methods_arg(methods_arg: str) -> Tuple[str, ...]:
+    methods = [part.strip() for part in methods_arg.split(",") if part.strip()]
+    return validate_methods(methods)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run truncated linear regression baselines and plot ||w_t - w*|| over time."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to YAML configuration file for the experiment setup.",
+    )
+    parser.add_argument(
+        "--R", 
+        type=int, 
+        default=1,
+        help="Number of independent reruns of the experiment.",
+    )
+    parser.add_argument(
+        "--T", 
+        type=int, 
+        default=None,
+        help="Number of PSGD iterations per rerun."
+    )
+    parser.add_argument(
+        "--verbose-every", 
+        type=int, 
+        default=None,
+        help="Print PSGD status every this many iterations."
+    )
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default=",".join(ALL_METHODS), 
+        help=f"Comma-separated subset of methods. Available: {', '.join(ALL_METHODS)}",
+    )
+    parser.add_argument(
+        "--output-plot",
+        type=str,
+        default="truncated_regression_comparison.png",
+        help="Path to save the output plot comparing methods.",
+    )
+    parser.add_argument(
+        "--no-plot", 
+        action="store_true",
+        help="If set, do not generate comparison plot.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    if args.config is not None:
+        setup = make_experiment_setup_from_yaml(args.config)
+    else:
+        setup = make_default_demo_setup()
+    if args.T is not None:
+        setup.psgd.T = int(args.T)
+    if args.verbose_every is not None:
+        setup.psgd.verbose_every = int(args.verbose_every)
+    methods = parse_methods_arg(args.methods)
+    result = run_repeated_experiment(
+        setup=setup,
+        R=args.R,
+        methods=methods,
+        base_seed=0,
+    )
+    print_experiment_summary(result)
+    if not args.no_plot:
+        plot_title = f"Truncated regression comparison ($R={args.R}$)"
+        plot_comparison(result, output_path=args.output_plot, show_std=True, title=plot_title)
+        print(f"\nSaved plot to: {args.output_plot}")
+
+
+if __name__ == "__main__":
+    main()
+
+````
+
+
+````yaml title=config.yaml
+problem:
+  w_star: [20, 20, 20, 20, 20, 20, 20, 20, 20, 20] # The parameter vector we want to estimate
+  truncation_intervals: # The intervals defining the truncation set
+    - [-3.75, -3]
+    - [-2.5, -1.5]
+    - [-1, 1]
+    - [2, 3]
+    - [3.25, 4] 
+  # The feature distribution is a mixture of Gaussians; feature_weights are the mixture weights, feature_means are the means of the Gaussians, and feature_covariance is the covariance matrix (same across all mixture components).
+  feature_weights: [0.25, 0.3, 0.15, 0.1, 0.2]
+  feature_means:
+    - [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    - [-0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5]
+    - [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+    - [0.5, 0.5, 0.5, 0.5, 0.5, -0.5, -0.5, -0.5, -0.5, -0.5]
+    - [-0.5, -0.5, -0.5, -0.5, -0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+  feature_covariance: [[1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                      [0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                      [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                      [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                      [0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+                      [0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+                      [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+                      [0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+                      [0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+                      [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]]
+  noise_std: 1.0 # The standard deviation of the noise in the linear regression model
+
+
+wrong_intervals:
+  - [-5.0, 5.0] # The incorrect truncation set used by the "PSGD with wrong S" method. No need to specify if not using this method.
+
+# To use default configuration for the warm start, set learning, and psgd procedures, simply do not include the relevant sections below.
+
+warm_start:
+  n_samples: 5000 # How many samples to use for the warm start OLS estimator
+  ridge: 1e-8
+
+set_learning:
+  n_samples: 5000 # How many samples to use for the set learning procedure
+  # Parameters below control how many gaps to remove when learning the truncation set.
+  r: null 
+  r_scale: 1.0
+  max_removed_gaps: 30
+  min_interval_width: 1e-8
+
+psgd:
+  radius: 10.0 # Radius of projection set for PSGD
+  T: 4500 # Number of PSGD iterations
+  batch_size: 128 # Batch size for minibatch gradient estimates
+  step0: 20.0 # Initial step size
+  step_schedule: inverse_sqrt # Rate of decay for step size; can be "constant", "inverse_sqrt", or "inverse"
+  # Miscellaneous parameters for PSGD
+  grad_clip: 10.0
+  use_conditional_mean: true
+  verbose_every: 500
+
+````
+
+
+````output
+/home/dineshai/Drives/Code/AllCode/ReproduceICML/papers/icml26-repro-DsV89lJ58l-truncated-regression/upstream/main.py:654: SyntaxWarning: invalid escape sequence '\s'
+  "PSGD with true $S^\star$": dict(linestyle="-", linewidth=LINE_WIDTH),
+[PSGD with wrong S] t=   500 | eta=0.8944 | grad_norm=0.7655 | proj_hit_rate=0.222 | error=6.505784
+[PSGD with wrong S] t=  1000 | eta=0.6325 | grad_norm=0.7333 | proj_hit_rate=0.111 | error=6.407377
+[PSGD with wrong S] t=  1500 | eta=0.5164 | grad_norm=0.6008 | proj_hit_rate=0.074 | error=6.611556
+[PSGD with wrong S] t=  2000 | eta=0.4472 | grad_norm=0.7993 | proj_hit_rate=0.056 | error=6.625484
+[PSGD with wrong S] t=  2500 | eta=0.4 | grad_norm=0.6308 | proj_hit_rate=0.044 | error=6.788931
+[PSGD with wrong S] t=  3000 | eta=0.3651 | grad_norm=0.7318 | proj_hit_rate=0.037 | error=6.826275
+[PSGD with wrong S] t=  3500 | eta=0.3381 | grad_norm=0.9219 | proj_hit_rate=0.032 | error=6.936621
+[PSGD with wrong S] t=  4000 | eta=0.3162 | grad_norm=1.0974 | proj_hit_rate=0.028 | error=6.976698
+[PSGD with wrong S] t=  4500 | eta=0.2981 | grad_norm=1.1523 | proj_hit_rate=0.025 | error=7.075335
+[PSGD with true S*] t=   500 | eta=0.8944 | grad_norm=0.7846 | proj_hit_rate=0.218 | error=5.422872
+[PSGD with true S*] t=  1000 | eta=0.6325 | grad_norm=0.7379 | proj_hit_rate=0.109 | error=3.233066
+[PSGD with true S*] t=  1500 | eta=0.5164 | grad_norm=0.5649 | proj_hit_rate=0.073 | error=2.225151
+[PSGD with true S*] t=  2000 | eta=0.4472 | grad_norm=0.8182 | proj_hit_rate=0.054 | error=1.543065
+[PSGD with true S*] t=  2500 | eta=0.4 | grad_norm=0.5914 | proj_hit_rate=0.044 | error=1.095179
+[PSGD with true S*] t=  3000 | eta=0.3651 | grad_norm=0.7642 | proj_hit_rate=0.036 | error=0.740826
+[PSGD with true S*] t=  3500 | eta=0.3381 | grad_norm=0.8521 | proj_hit_rate=0.031 | error=0.607398
+[PSGD with true S*] t=  4000 | eta=0.3162 | grad_norm=1.0312 | proj_hit_rate=0.027 | error=0.554807
+[PSGD with true S*] t=  4500 | eta=0.2981 | grad_norm=1.1089 | pro
+... [8899 chars elided] ...
+GD with wrong S] t=   500 | eta=0.8944 | grad_norm=0.9273 | proj_hit_rate=0.222 | error=6.652624
+[PSGD with wrong S] t=  1000 | eta=0.6325 | grad_norm=1.4669 | proj_hit_rate=0.111 | error=6.405896
+[PSGD with wrong S] t=  1500 | eta=0.5164 | grad_norm=0.8638 | proj_hit_rate=0.074 | error=6.641567
+[PSGD with wrong S] t=  2000 | eta=0.4472 | grad_norm=0.7290 | proj_hit_rate=0.056 | error=6.879548
+[PSGD with wrong S] t=  2500 | eta=0.4 | grad_norm=1.0198 | proj_hit_rate=0.044 | error=7.058031
+[PSGD with wrong S] t=  3000 | eta=0.3651 | grad_norm=0.9519 | proj_hit_rate=0.037 | error=7.042129
+[PSGD with wrong S] t=  3500 | eta=0.3381 | grad_norm=1.0735 | proj_hit_rate=0.032 | error=7.086928
+[PSGD with wrong S] t=  4000 | eta=0.3162 | grad_norm=1.2620 | proj_hit_rate=0.028 | error=7.165292
+[PSGD with wrong S] t=  4500 | eta=0.2981 | grad_norm=1.0495 | proj_hit_rate=0.025 | error=7.222510
+[PSGD with true S*] t=   500 | eta=0.8944 | grad_norm=0.8835 | proj_hit_rate=0.222 | error=5.504811
+[PSGD with true S*] t=  1000 | eta=0.6325 | grad_norm=1.3642 | proj_hit_rate=0.111 | error=3.219827
+[PSGD with true S*] t=  1500 | eta=0.5164 | grad_norm=0.7216 | proj_hit_rate=0.074 | error=2.301266
+[PSGD with true S*] t=  2000 | eta=0.4472 | grad_norm=0.7101 | proj_hit_rate=0.056 | error=1.721282
+[PSGD with true S*] t=  2500 | eta=0.4 | grad_norm=1.0487 | proj_hit_rate=0.044 | error=1.451650
+[PSGD with true S*] t=  3000 | eta=0.3651 | grad_norm=0.9820 | proj_hit_rate=0.037 | error=1.016116
+[PSGD with true S*] t=  3500 | eta=0.3381 | grad_norm=1.0424 | proj_hit_rate=0.032 | error=0.776618
+[PSGD with true S*] t=  4000 | eta=0.3162 | grad_norm=1.1573 | proj_hit_rate=0.028 | error=0.552501
+[PSGD with true S*] t=  4500 | eta=0.2981 | grad_norm=1.0174 | proj_hit_rate=0.025 | error=0.528260
+[Full algorithm] t=   500 | eta=0.8944 | grad_norm=0.8846 | proj_hit_rate=0.222 | error=5.552966
+[Full algorithm] t=  1000 | eta=0.6325 | grad_norm=1.3664 | proj_hit_rate=0.111 | error=3.327538
+[Full algorithm] t=  1500 | eta=0.5164 | grad_norm=0.7235 | proj_hit_rate=0.074 | error=2.442460
+[Full algorithm] t=  2000 | eta=0.4472 | grad_norm=0.7100 | proj_hit_rate=0.056 | error=1.890534
+[Full algorithm] t=  2500 | eta=0.4 | grad_norm=1.0487 | proj_hit_rate=0.044 | error=1.625100
+[Full algorithm] t=  3000 | eta=0.3651 | grad_norm=0.9821 | proj_hit_rate=0.037 | error=1.206420
+[Full algorithm] t=  3500 | eta=0.3381 | grad_norm=1.0431 | proj_hit_rate=0.032 | error=0.964950
+[Full algorithm] t=  4000 | eta=0.3162 | grad_norm=1.1591 | proj_hit_rate=0.028 | error=0.757331
+[Full algorithm] t=  4500 | eta=0.2981 | grad_norm=1.0172 | proj_hit_rate=0.025 | error=0.703144
+[PSGD with wrong S] t=   500 | eta=0.8944 | grad_norm=1.0261 | proj_hit_rate=0.220 | error=6.784418
+[PSGD with wrong S] t=  1000 | eta=0.6325 | grad_norm=1.0880 | proj_hit_rate=0.110 | error=6.868292
+[PSGD with wrong S] t=  1500 | eta=0.5164 | grad_norm=0.8061 | proj_hit_rate=0.073 | error=7.011147
+[PSGD with wrong S] t=  2000 | eta=0.4472 | grad_norm=0.8499 | proj_hit_rate=0.055 | error=7.236051
+[PSGD with wrong S] t=  2500 | eta=0.4 | grad_norm=0.9874 | proj_hit_rate=0.044 | error=7.386976
+[PSGD with wrong S] t=  3000 | eta=0.3651 | grad_norm=0.6158 | proj_hit_rate=0.037 | error=7.348952
+[PSGD with wrong S] t=  3500 | eta=0.3381 | grad_norm=1.0373 | proj_hit_rate=0.031 | error=7.340943
+[PSGD with wrong S] t=  4000 | eta=0.3162 | grad_norm=1.3097 | proj_hit_rate=0.028 | error=7.431262
+[PSGD with wrong S] t=  4500 | eta=0.2981 | grad_norm=0.7289 | proj_hit_rate=0.024 | error=7.406214
+[PSGD with true S*] t=   500 | eta=0.8944 | grad_norm=0.9510 | proj_hit_rate=0.218 | error=5.403143
+[PSGD with true S*] t=  1000 | eta=0.6325 | grad_norm=0.9721 | proj_hit_rate=0.109 | error=3.513181
+[PSGD with true S*] t=  1500 | eta=0.5164 | grad_norm=0.8695 | proj_hit_rate=0.073 | error=2.567363
+[PSGD with true S*] t=  2000 | eta=0.4472 | grad_norm=0.7248 | proj_hit_rate=0.054 | error=2.063551
+[PSGD with true S*] t=  2500 | eta=0.4 | grad_norm=0.9459 | proj_hit_rate=0.044 | error=1.689821
+[PSGD with true S*] t=  3000 | eta=0.3651 | grad_norm=0.6352 | proj_hit_rate=0.036 | error=1.262257
+[PSGD with true S*] t=  3500 | eta=0.3381 | grad_norm=0.9881 | proj_hit_rate=0.031 | error=1.002874
+[PSGD with true S*] t=  4000 | eta=0.3162 | grad_norm=1.3492 | proj_hit_rate=0.027 | error=0.907119
+[PSGD with true S*] t=  4500 | eta=0.2981 | grad_norm=0.6654 | proj_hit_rate=0.024 | error=0.660983
+[Full algorithm] t=   500 | eta=0.8944 | grad_norm=0.9558 | proj_hit_rate=0.218 | error=5.451634
+[Full algorithm] t=  1000 | eta=0.6325 | grad_norm=0.9745 | proj_hit_rate=0.109 | error=3.616772
+[Full algorithm] t=  1500 | eta=0.5164 | grad_norm=0.8699 | proj_hit_rate=0.073 | error=2.702474
+[Full algorithm] t=  2000 | eta=0.4472 | grad_norm=0.7265 | proj_hit_rate=0.054 | error=2.221304
+[Full algorithm] t=  2500 | eta=0.4 | grad_norm=0.9469 | proj_hit_rate=0.044 | error=1.864169
+[Full algorithm] t=  3000 | eta=0.3651 | grad_norm=0.6353 | proj_hit_rate=0.036 | error=1.450373
+[Full algorithm] t=  3500 | eta=0.3381 | grad_norm=0.9901 | proj_hit_rate=0.031 | error=1.193075
+[Full algorithm] t=  4000 | eta=0.3162 | grad_norm=1.3498 | proj_hit_rate=0.027 | error=1.095762
+[Full algorithm] t=  4500 | eta=0.2981 | grad_norm=0.6662 | proj_hit_rate=0.024 | error=0.860490
+[PSGD with wrong S] t=   500 | eta=0.8944 | grad_norm=1.2964 | proj_hit_rate=0.220 | error=6.728170
+[PSGD with wrong S] t=  1000 | eta=0.6325 | grad_norm=1.3721 | proj_hit_rate=0.110 | error=6.384025
+[PSGD with wrong S] t=  1500 | eta=0.5164 | grad_norm=0.5177 | proj_hit_rate=0.073 | error=6.517565
+[PSGD with wrong S] t=  2000 | eta=0.4472 | grad_norm=1.1614 | proj_hit_rate=0.055 | error=6.716966
+[PSGD with wrong S] t=  2500 | eta=0.4 | grad_norm=0.9302 | proj_hit_rate=0.044 | error=6.720303
+[PSGD with wrong S] t=  3000 | eta=0.3651 | grad_norm=0.6752 | proj_hit_rate=0.037 | error=6.720747
+[PSGD with wrong S] t=  3500 | eta=0.3381 | grad_norm=1.0817 | proj_hit_rate=0.031 | error=6.855516
+[PSGD with wrong S] t=  4000 | eta=0.3162 | grad_norm=0.5499 | proj_hit_rate=0.028 | error=6.803653
+[PSGD with wrong S] t=  4500 | eta=0.2981 | grad_norm=1.3718 | proj_hit_rate=0.024 | error=6.912723
+[PSGD with true S*] t=   500 | eta=0.8944 | grad_norm=1.1741 | proj_hit_rate=0.218 | error=5.273392
+[PSGD with true S*] t=  1000 | eta=0.6325 | grad_norm=1.3010 | proj_hit_rate=0.109 | error=2.980739
+[PSGD with true S*] t=  1500 | eta=0.5164 | grad_norm=0.4876 | proj_hit_rate=0.073 | error=1.959390
+[PSGD with true S*] t=  2000 | eta=0.4472 | grad_norm=1.1089 | proj_hit_rate=0.054 | error=1.425565
+[PSGD with true S*] t=  2500 | eta=0.4 | grad_norm=0.9285 | proj_hit_rate=0.044 | error=0.999765
+[PSGD with true S*] t=  3000 | eta=0.3651 | grad_norm=0.6336 | proj_hit_rate=0.036 | error=0.522179
+[PSGD with true S*] t=  3500 | eta=0.3381 | grad_norm=1.0631 | proj_hit_rate=0.031 | error=0.405546
+[PSGD with true S*] t=  4000 | eta=0.3162 | grad_norm=0.4939 | proj_hit_rate=0.029 | error=0.373723
+[PSGD with true S*] t=  4500 | eta=0.2981 | grad_norm=1.3512 | proj_hit_rate=0.032 | error=0.577856
+[Full algorithm] t=   500 | eta=0.8944 | grad_norm=1.1745 | proj_hit_rate=0.218 | error=5.316209
+[Full algorithm] t=  1000 | eta=0.6325 | grad_norm=1.3010 | proj_hit_rate=0.109 | error=3.076911
+[Full algorithm] t=  1500 | eta=0.5164 | grad_norm=0.4883 | proj_hit_rate=0.073 | error=2.089120
+[Full algorithm] t=  2000 | eta=0.4472 | grad_norm=1.1103 | proj_hit_rate=0.054 | error=1.575906
+[Full algorithm] t=  2500 | eta=0.4 | grad_norm=0.9288 | proj_hit_rate=0.044 | error=1.150662
+[Full algorithm] t=  3000 | eta=0.3651 | grad_norm=0.6344 | proj_hit_rate=0.036 | error=0.692793
+[Full algorithm] t=  3500 | eta=0.3381 | grad_norm=1.0626 | proj_hit_rate=0.031 | error=0.566897
+[Full algorithm] t=  4000 | eta=0.3162 | grad_norm=0.4946 | proj_hit_rate=0.027 | error=0.427737
+[Full algorithm] t=  4500 | eta=0.2981 | grad_norm=1.3520 | proj_hit_rate=0.024 | error=0.588069
+[PSGD with wrong S] t=   500 | eta=0.8944 | grad_norm=0.8773 | proj_hit_rate=0.216 | error=6.322731
+[PSGD with wrong S] t=  1000 | eta=0.6325 | grad_norm=1.1772 | proj_hit_rate=0.108 | error=6.274752
+[PSGD with wrong S] t=  1500 | eta=0.5164 | grad_norm=1.1750 | proj_hit_rate=0.072 | error=6.496834
+[PSGD with wrong S] t=  2000 | eta=0.4472 | grad_norm=1.6003 | proj_hit_rate=0.054 | error=6.750271
+[PSGD with wrong S] t=  2500 | eta=0.4 | grad_norm=0.8116 | proj_hit_rate=0.043 | error=6.895670
+[PSGD with wrong S] t=  3000 | eta=0.3651 | grad_norm=0.9527 | proj_hit_rate=0.036 | error=6.973277
+[PSGD with wrong S] t=  3500 | eta=0.3381 | grad_norm=0.9810 | proj_hit_rate=0.031 | error=7.097104
+[PSGD with wrong S] t=  4000 | eta=0.3162 | grad_norm=1.2281 | proj_hit_rate=0.027 | error=7.196807
+[PSGD with wrong S] t=  4500 | eta=0.2981 | grad_norm=0.9266 | proj_hit_rate=0.024 | error=7.223749
+[PSGD with true S*] t=   500 | eta=0.8944 | grad_norm=0.9112 | proj_hit_rate=0.216 | error=4.684998
+[PSGD with true S*] t=  1000 | eta=0.6325 | grad_norm=0.9673 | proj_hit_rate=0.108 | error=2.695691
+[PSGD with true S*] t=  1500 | eta=0.5164 | grad_norm=1.1305 | proj_hit_rate=0.072 | error=1.808142
+[PSGD with true S*] t=  2000 | eta=0.4472 | grad_norm=1.6348 | proj_hit_rate=0.054 | error=1.390192
+[PSGD with true S*] t=  2500 | eta=0.4 | grad_norm=0.7856 | proj_hit_rate=0.043 | error=1.051030
+[PSGD with true S*] t=  3000 | eta=0.3651 | grad_norm=0.9342 | proj_hit_rate=0.036 | error=0.729047
+[PSGD with true S*] t=  3500 | eta=0.3381 | grad_norm=0.9497 | proj_hit_rate=0.031 | error=0.705757
+[PSGD with true S*] t=  4000 | eta=0.3162 | grad_norm=1.1441 | proj_hit_rate=0.027 | error=0.544077
+[PSGD with true S*] t=  4500 | eta=0.2981 | grad_norm=0.8599 | proj_hit_rate=0.024 | error=0.471905
+[Full algorithm] t=   500 | eta=0.8944 | grad_norm=0.9175 | proj_hit_rate=0.216 | error=4.743601
+[Full algorithm] t=  1000 | eta=0.6325 | grad_norm=0.9698 | proj_hit_rate=0.108 | error=2.827760
+[Full algorithm] t=  1500 | eta=0.5164 | grad_norm=1.1303 | proj_hit_rate=0.072 | error=1.982151
+[Full algorithm] t=  2000 | eta=0.4472 | grad_norm=1.6359 | proj_hit_rate=0.054 | error=1.585798
+[Full algorithm] t=  2500 | eta=0.4 | grad_norm=0.7849 | proj_hit_rate=0.043 | error=1.259645
+[Full algorithm] t=  3000 | eta=0.3651 | grad_norm=0.9350 | proj_hit_rate=0.036 | error=0.957103
+[Full algorithm] t=  3500 | eta=0.3381 | grad_norm=0.9511 | proj_hit_rate=0.031 | error=0.904868
+[Full algorithm] t=  4000 | eta=0.3162 | grad_norm=1.1479 | proj_hit_rate=0.027 | error=0.755568
+[Full algorithm] t=  4500 | eta=0.2981 | grad_norm=0.8614 | proj_hit_rate=0.024 | error=0.659734
+[PSGD with wrong S] t=   500 | eta=0.8944 | grad_norm=0.6605 | proj_hit_rate=0.226 | error=6.818642
+[PSGD with wrong S] t=  1000 | eta=0.6325 | grad_norm=1.4093 | proj_hit_rate=0.113 | error=6.694109
+[PSGD with wrong S] t=  1500 | eta=0.5164 | grad_norm=0.8765 | proj_hit_rate=0.075 | error=6.732571
+[PSGD with wrong S] t=  2000 | eta=0.4472 | grad_norm=1.7074 | proj_hit_rate=0.057 | error=6.767210
+[PSGD with wrong S] t=  2500 | eta=0.4 | grad_norm=0.8550 | proj_hit_rate=0.045 | error=6.727414
+[PSGD with wrong S] t=  3000 | eta=0.3651 | grad_norm=0.5861 | proj_hit_rate=0.038 | error=6.880450
+[PSGD with wrong S] t=  3500 | eta=0.3381 | grad_norm=0.8245 | proj_hit_rate=0.032 | error=6.972653
+[PSGD with wrong S] t=  4000 | eta=0.3162 | grad_norm=0.9219 | proj_hit_rate=0.028 | error=7.065216
+[PSGD with wrong S] t=  4500 | eta=0.2981 | grad_norm=0.7581 | proj_hit_rate=0.025 | error=7.216430
+[PSGD with true S*] t=   500 | eta=0.8944 | grad_norm=0.5994 | proj_hit_rate=0.224 | error=5.442430
+[PSGD with true S*] t=  1000 | eta=0.6325 | grad_norm=1.3897 | proj_hit_rate=0.112 | error=3.371000
+[PSGD with true S*] t=  1500 | eta=0.5164 | grad_norm=0.8620 | proj_hit_rate=0.075 | error=2.284295
+[PSGD with true S*] t=  2000 | eta=0.4472 | grad_norm=1.6799 | proj_hit_rate=0.056 | error=1.702978
+[PSGD with true S*] t=  2500 | eta=0.4 | grad_norm=0.8494 | proj_hit_rate=0.045 | error=1.014618
+[PSGD with true S*] t=  3000 | eta=0.3651 | grad_norm=0.5962 | proj_hit_rate=0.037 | error=0.834684
+[PSGD with true S*] t=  3500 | eta=0.3381 | grad_norm=0.7972 | proj_hit_rate=0.032 | error=0.594638
+[PSGD with true S*] t=  4000 | eta=0.3162 | grad_norm=0.9157 | proj_hit_rate=0.028 | error=0.567205
+[PSGD with true S*] t=  4500 | eta=0.2981 | grad_norm=0.7787 | proj_hit_rate=0.025 | error=0.512178
+[Full algorithm] t=   500 | eta=0.8944 | grad_norm=0.5991 | proj_hit_rate=0.224 | error=5.490144
+[Full algorithm] t=  1000 | eta=0.6325 | grad_norm=1.3927 | proj_hit_rate=0.112 | error=3.475282
+[Full algorithm] t=  1500 | eta=0.5164 | grad_norm=0.8625 | proj_hit_rate=0.075 | error=2.422387
+[Full algorithm] t=  2000 | eta=0.4472 | grad_norm=1.6815 | proj_hit_rate=0.056 | error=1.849654
+[Full algorithm] t=  2500 | eta=0.4 | grad_norm=0.8509 | proj_hit_rate=0.045 | error=1.190373
+[Full algorithm] t=  3000 | eta=0.3651 | grad_norm=0.5967 | proj_hit_rate=0.037 | error=1.003775
+[Full algorithm] t=  3500 | eta=0.3381 | grad_norm=0.7979 | proj_hit_rate=0.032 | error=0.771317
+[Full algorithm] t=  4000 | eta=0.3162 | grad_norm=0.9160 | proj_hit_rate=0.028 | error=0.711032
+[Full algorithm] t=  4500 | eta=0.2981 | grad_norm=0.7788 | proj_hit_rate=0.025 | error=0.661001
+[PSGD with wrong S] t=   500 | eta=0.8944 | grad_norm=1.9635 | proj_hit_rate=0.224 | error=6.084150
+[PSGD with wrong S] t=  1000 | eta=0.6325 | grad_norm=0.7238 | proj_hit_rate=0.112 | error=6.320641
+[PSGD with wrong S] t=  1500 | eta=0.5164 | grad_norm=0.8328 | proj_hit_rate=0.075 | error=6.550067
+[PSGD with wrong S] t=  2000 | eta=0.4472 | grad_norm=0.6501 | proj_hit_rate=0.056 | error=6.648153
+[PSGD with wrong S] t=  2500 | eta=0.4 | grad_norm=0.9572 | proj_hit_rate=0.045 | error=6.777976
+[PSGD with wrong S] t=  3000 | eta=0.3651 | grad_norm=0.6053 | proj_hit_rate=0.037 | error=6.866931
+[PSGD with wrong S] t=  3500 | eta=0.3381 | grad_norm=0.8202 | proj_hit_rate=0.032 | error=7.039801
+[PSGD with wrong S] t=  4000 | eta=0.3162 | grad_norm=0.8656 | proj_hit_rate=0.028 | error=7.059313
+[PSGD with wrong S] t=  4500 | eta=0.2981 | grad_norm=1.4480 | proj_hit_rate=0.025 | error=7.132319
+[PSGD with true S*] t=   500 | eta=0.8944 | grad_norm=1.3147 | proj_hit_rate=0.224 | error=4.809842
+[PSGD with true S*] t=  1000 | eta=0.6325 | grad_norm=0.7094 | proj_hit_rate=0.112 | error=2.992963
+[PSGD with true S*] t=  1500 | eta=0.5164 | grad_norm=0.8048 | proj_hit_rate=0.075 | error=2.095457
+[PSGD with true S*] t=  2000 | eta=0.4472 | grad_norm=0.6561 | proj_hit_rate=0.056 | error=1.462006
+[PSGD with true S*] t=  2500 | eta=0.4 | grad_norm=0.8874 | proj_hit_rate=0.045 | error=1.023337
+[PSGD with true S*] t=  3000 | eta=0.3651 | grad_norm=0.6259 | proj_hit_rate=0.037 | error=0.747615
+[PSGD with true S*] t=  3500 | eta=0.3381 | grad_norm=0.7725 | proj_hit_rate=0.032 | error=0.761191
+[PSGD with true S*] t=  4000 | eta=0.3162 | grad_norm=0.8147 | proj_hit_rate=0.028 | error=0.522865
+[PSGD with true S*] t=  4500 | eta=0.2981 | grad_norm=1.2960 | proj_hit_rate=0.025 | error=0.404426
+[Full algorithm] t=   500 | eta=0.8944 | grad_norm=1.3235 | proj_hit_rate=0.224 | error=4.855778
+[Full algorithm] t=  1000 | eta=0.6325 | grad_norm=0.7109 | proj_hit_rate=0.112 | error=3.097225
+[Full algorithm] t=  1500 | eta=0.5164 | grad_norm=0.8063 | proj_hit_rate=0.075 | error=2.233225
+[Full algorithm] t=  2000 | eta=0.4472 | grad_norm=0.6566 | proj_hit_rate=0.056 | error=1.617624
+[Full algorithm] t=  2500 | eta=0.4 | grad_norm=0.8887 | proj_hit_rate=0.045 | error=1.197820
+[Full algorithm] t=  3000 | eta=0.3651 | grad_norm=0.6250 | proj_hit_rate=0.037 | error=0.924546
+[Full algorithm] t=  3500 | eta=0.3381 | grad_norm=0.7730 | proj_hit_rate=0.032 | error=0.914236
+[Full algorithm] t=  4000 | eta=0.3162 | grad_norm=0.8163 | proj_hit_rate=0.028 | error=0.671653
+[Full algorithm] t=  4500 | eta=0.2981 | grad_norm=1.2971 | proj_hit_rate=0.025 | error=0.539920
+Problem dimension: 10
+True w*: [20. 20. 20. 20. 20. 20. 20. 20. 20. 20.]
+True truncation set S*: [(-3.75, -3.0), (-2.5, -1.5), (-1.0, 1.0), (2.0, 3.0), (3.25, 4.0)]
+Wrong-set baseline uses S: [(-5.0, 5.0)]
+Number of outer reruns R: 10
+PSGD iterations T: 4500
+Estimated survival probability: 0.02324
+Warm-start error ||w_hat - w*|| (run 1): 9.813992624636278
+Learned truncation intervals (run 1): [(-3.74658383554214, -3.000703547178781), (-2.4993233928859473, -2.367281384394154), (-2.3631915711220244, -2.3582595990733464), (-2.354975962216703, -1.936792290316113), (-1.9285835633416921, -1.9275476580350976), (-1.9242025158487142, -1.7700029527477024), (-1.7665538673859307, -1.5023551231998151), (-0.9943279555187122, -0.9144955912830294), (-0.9113256886322011, -0.8532931684969794), (-0.8501013147579255, -0.7418068833525291), (-0.7403873761191511, -0.6844406836897741), (-0.6793472015517961, -0.5449885256272755), (-0.5425354007903684, -0.4579799519910658), (-0.45506099600306793, -0.3196621097501193), (-0.3157952233862644, -0.309083484048541), (-0.30722939086477186, -0.14457997921429877), (-0.1414054603228984, 0.011837897863705593), (0.016792222643007504, 0.11659516973385536), (0.12338596919713596, 0.41556680364237253), (0.41851929292297363, 0.6368933593524173), (0.6405895305453551, 0.7154823798382677), (0.7208247651135579, 0.7840834729207047), (0.7884286891015156, 0.9003586584290215), (0.9026504667607503, 0.9186882583249939), (0.9231457817382682, 0.9382705298251159), (0.9423706627271462, 0.9998289419538642), (2.000428016193057, 2.083185993401204), (2.0888372189476607, 2.1273417114145), (2.131408131116997, 2.294092960611743), (2.297172679743273, 2.9988545704437977), (3.25169033296725, 3.999912968332211)]
+
+Final error summary (mean +/- std across reruns):
+  OLS (no correction)      : 9.852682 +/- 0.250369
+  PSGD with wrong S        : 7.170760 +/- 0.149235
+  PSGD with true S*        : 0.522706 +/- 0.080022
+  Full algorithm           : 0.653189 +/- 0.110646
+
+Saved plot to: outputs/source_r10.png
+
+````

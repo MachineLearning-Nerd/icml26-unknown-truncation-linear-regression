@@ -1,0 +1,16 @@
+{
+  "method": "independent scalar normal controls; no upstream imports",
+  "positive_only": {
+    "learned_interval_count": 31,
+    "reference_symmetric_difference_mass": 0.007898979615557723,
+    "shifted_reference_negative_control_mass": 0.5153108289055759,
+    "truth_mass": 0.42742806527236527
+  },
+  "truncated_likelihood": {
+    "true_set_error": 0.007669167668300059,
+    "true_set_estimate": 1.2576691676683,
+    "w_star": 1.25,
+    "wrong_set_error": 0.09941965861833357,
+    "wrong_set_estimate": 1.1505803413816664
+  }
+}

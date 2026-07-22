@@ -1,0 +1,42 @@
+{
+  "author_commit": "a14732163158aff75113e3e1c50a90ecc27b4250",
+  "author_dirty": false,
+  "claims": {
+    "C1": "Primary Theorem 3.1 was source-audited; full source simulation is preserved.",
+    "C2": "The three stated assumptions were audited against the primary source and CPU configuration.",
+    "C3": "Independent positive-only recovery passes and a disjoint-reference control fails strongly.",
+    "C4": "Pinned full Phase-I/II source run beats OLS and wrong-set PSGD; independent likelihood control agrees.",
+    "C5": "Primary smoothness lemma was source-audited; independent conditional-normal calculations are exercised.",
+    "C6": "Primary related-work comparison was source-audited (an asymptotic claim, not a timing benchmark)."
+  },
+  "failures": [],
+  "full_scale": {
+    "plot": "outputs/source_r10.png",
+    "psgd_iterations": 4500,
+    "reruns": 10
+  },
+  "independent_controls": {
+    "method": "independent scalar normal controls; no upstream imports",
+    "positive_only": {
+      "learned_interval_count": 31,
+      "reference_symmetric_difference_mass": 0.007898979615557723,
+      "shifted_reference_negative_control_mass": 0.5153108289055759,
+      "truth_mass": 0.42742806527236527
+    },
+    "truncated_likelihood": {
+      "true_set_error": 0.007669167668300059,
+      "true_set_estimate": 1.2576691676683,
+      "w_star": 1.25,
+      "wrong_set_error": 0.09941965861833357,
+      "wrong_set_estimate": 1.1505803413816664
+    }
+  },
+  "paper": "DsV89lJ58l",
+  "pass": true,
+  "source_summary": {
+    "full_algorithm_mean_error": 0.653189,
+    "ols_mean_error": 9.852682,
+    "true_set_mean_error": 0.522706,
+    "wrong_set_mean_error": 7.17076
+  }
+}

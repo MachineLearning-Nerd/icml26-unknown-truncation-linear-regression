@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "title": "Repro - Linear Regression with Unknown Truncation Beyond Gaussian Features",
+  "emoji": "🎯",
+  "space_id": null,
+  "paper": null,
+  "tags": [],
+  "updated_at": "2026-07-22T11:49:18+00:00",
+  "root": {
+    "slug": "index",
+    "title": "Repro - Linear Regression with Unknown Truncation Beyond Gaussian Features",
+    "file": "pages/index.md",
+    "children": [
+      {
+        "slug": "source-replication-calibration",
+        "title": "Source replication — calibration",
+        "file": "pages/source-replication-calibration/page.md",
+        "children": []
+      },
+      {
+        "slug": "source-replication-paper-scale",
+        "title": "Source replication — paper-scale",
+        "file": "pages/source-replication-paper-scale/page.md",
+        "children": []
+      },
+      {
+        "slug": "independent-mechanisms",
+        "title": "Independent mechanisms",
+        "file": "pages/independent-mechanisms/page.md",
+        "children": []
+      },
+      {
+        "slug": "independent-mechanisms-corrected-negative-control",
+        "title": "Independent mechanisms — corrected negative control",
+        "file": "pages/independent-mechanisms-corrected-negative-control/page.md",
+        "children": []
+      },
+      {
+        "slug": "methods",
+        "title": "Methods",
+        "file": "pages/methods/page.md",
+        "children": []
+      },
+      {
+        "slug": "claim-c1-theorem",
+        "title": "Claim C1 — theorem",
+        "file": "pages/claim-c1-theorem/page.md",
+        "children": []
+      },
+      {
+        "slug": "claim-c2-assumptions",
+        "title": "Claim C2 — assumptions",
+        "file": "pages/claim-c2-assumptions/page.md",
+        "children": []
+      },
+      {
+        "slug": "claim-c3-positive-only-phase-i",
+        "title": "Claim C3 — positive-only Phase I",
+        "file": "pages/claim-c3-positive-only-phase-i/page.md",
+        "children": []
+      },
+      {
+        "slug": "claim-c4-phase-ii-psgd",
+        "title": "Claim C4 — Phase II PSGD",
+        "file": "pages/claim-c4-phase-ii-psgd/page.md",
+        "children": []
+      },
+      {
+        "slug": "claim-c5-smoothness",
+        "title": "Claim C5 — smoothness",
+        "file": "pages/claim-c5-smoothness/page.md",
+        "children": []
+      },
+      {
+        "slug": "claim-c6-prior-work",
+        "title": "Claim C6 — prior work",
+        "file": "pages/claim-c6-prior-work/page.md",
+        "children": []
+      },
+      {
+        "slug": "negative-controls",
+        "title": "Negative controls",
+        "file": "pages/negative-controls/page.md",
+        "children": []
+      },
+      {
+        "slug": "conclusion",
+        "title": "Conclusion",
+        "file": "pages/conclusion/page.md",
+        "children": []
+      }
+    ]
+  },
+  "agent_view_tokens": 2655,
+  "revision": "1784720958881217913"
+}
