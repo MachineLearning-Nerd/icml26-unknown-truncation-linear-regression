@@ -24,9 +24,11 @@ one repetition.  Final parameter errors were OLS `9.813993`, wrong-set PSGD
 `outputs/source_r1.png`.  The run finished cleanly in roughly three minutes.
 The paper-scale ten-repetition source protocol is the active next run.
 
-Next: execute `repro/src/run_publication_gate.py`, perform the secret scan,
-initialize/push the public GitHub repository, then atomically enqueue only if
-the local gate remains affirmative. The first independent-control attempt is
-retained in Trackio as a failed, too-weak negative control and is not evidence.
+Completed local gate, public GitHub push, and atomic canonical backlog handoff.
+GitHub: `MachineLearning-Nerd/icml26-repro-DsV89lJ58l-truncated-regression`
+at `37e7768`. The shared drain now exclusively owns Hugging Face Space
+creation/readback; this workspace must not publish directly. The first
+independent-control attempt is retained in Trackio as a failed, too-weak
+negative control and is not evidence.
 
 FULL_GATE_READY: DsV89lJ58l
