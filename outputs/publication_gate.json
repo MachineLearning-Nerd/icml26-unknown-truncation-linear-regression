@@ -1,19 +1,56 @@
 {
-  "author_commit": "a14732163158aff75113e3e1c50a90ecc27b4250",
-  "author_dirty": false,
-  "claims": {
-    "C1": "Primary Theorem 3.1 was source-audited; full source simulation is preserved.",
-    "C2": "The three stated assumptions were audited against the primary source and CPU configuration.",
-    "C3": "Independent positive-only recovery passes and a disjoint-reference control fails strongly.",
-    "C4": "Pinned full Phase-I/II source run beats OLS and wrong-set PSGD; independent likelihood control agrees.",
-    "C5": "Primary smoothness lemma was source-audited; independent conditional-normal calculations are exercised.",
-    "C6": "Primary related-work comparison was source-audited (an asymptotic claim, not a timing benchmark)."
-  },
+  "paper": "DsV89lJ58l",
+  "arxiv": "2602.12534",
+  "status": "INCONCLUSIVE",
+  "scoped_gate_passed": true,
+  "publication_gate_passed": true,
+  "tests_passed": true,
   "failures": [],
+  "paper_claims_total": 6,
+  "paper_claims_verified": 0,
+  "current_claim_status": {
+    "C1": "SOURCE_AUDITED_CONDITIONAL",
+    "C2": "SOURCE_AUDITED_CONDITIONAL",
+    "C3": "REPRODUCED_SCOPED",
+    "C4": "REPRODUCED_SCOPED",
+    "C5": "SOURCE_AUDITED_CONDITIONAL",
+    "C6": "SOURCE_AUDITED_ONLY"
+  },
+  "claim_confidence": {
+    "C1": "MEDIUM",
+    "C2": "MEDIUM",
+    "C3": "MEDIUM",
+    "C4": "MEDIUM/HIGH",
+    "C5": "MEDIUM",
+    "C6": "LOW"
+  },
+  "claim_verdicts": {
+    "C1": "Theorem 3.1 source-audited; finite author protocol preserved",
+    "C2": "assumptions source-audited against the released configuration",
+    "C3": "independent positive-only mechanism and disjoint-reference control pass",
+    "C4": "pinned R=10 source protocol and scalar likelihood control pass",
+    "C5": "Lemma 3.4 source-audited; conditional-normal calculations exercised",
+    "C6": "related-work/asymptotic comparison source-audited only"
+  },
+  "author_source": {
+    "repository": "https://github.com/alexkouridakis/truncated-regression",
+    "commit": "a14732163158aff75113e3e1c50a90ecc27b4250",
+    "dirty": false,
+    "main_py_sha256": "2877a8e00c36a3de8fcb489f7476524a6773f915dfe2167a9cf96446f36b81dc",
+    "config_yaml_sha256": "7a9332fa26e658c73fb6001689844af73cd8f30c4a65457bdadbe0c5012c3fc0",
+    "paper_link_in_author_readme": "https://arxiv.org/abs/2602.12534v1"
+  },
   "full_scale": {
-    "plot": "outputs/source_r10.png",
+    "reruns": 10,
     "psgd_iterations": 4500,
-    "reruns": 10
+    "batch_size": 128,
+    "plot": "outputs/source_r10.png",
+    "summary": {
+      "ols_mean_error": 9.852682,
+      "wrong_set_mean_error": 7.170760,
+      "true_set_mean_error": 0.522706,
+      "full_algorithm_mean_error": 0.653189
+    }
   },
   "independent_controls": {
     "method": "independent scalar normal controls; no upstream imports",
@@ -31,14 +68,9 @@
       "wrong_set_estimate": 1.1505803413816664
     }
   },
-  "paper": "DsV89lJ58l",
-  "pass": true,
-  "publication_gate_passed": true,
-  "source_summary": {
-    "full_algorithm_mean_error": 0.653189,
-    "ols_mean_error": 9.852682,
-    "true_set_mean_error": 0.522706,
-    "wrong_set_mean_error": 7.17076
+  "evidence_hashes": {
+    "outputs/source_r10.png": "75f563afdb4e5480ea9a63c2b8e1b2867b8e3bdc7710290f2ffc66b449c1842a",
+    "outputs/independent_mechanisms.json": "4afedf76550920e9d6b3de8ba2ab6e4a9bdd175af8a4bbd376f2a4c59ea42d46"
   },
-  "tests_passed": true
+  "status_note": "The gate passes its source, output, independent-control, and test contracts. It is a scoped documentation/evidence gate; no universal paper claim is independently formalized, so the paper-level assessment remains INCONCLUSIVE."
 }

@@ -75,18 +75,23 @@ def main() -> None:
     source_map = ROOT / "docs" / "primary_source_map.md"
     check(source_map.is_file() and "C1" in source_map.read_text(), "primary-source claim map is missing", failures)
     claims = {
-        "C1": "Primary Theorem 3.1 was source-audited; full source simulation is preserved.",
-        "C2": "The three stated assumptions were audited against the primary source and CPU configuration.",
-        "C3": "Independent positive-only recovery passes and a disjoint-reference control fails strongly.",
-        "C4": "Pinned full Phase-I/II source run beats OLS and wrong-set PSGD; independent likelihood control agrees.",
-        "C5": "Primary smoothness lemma was source-audited; independent conditional-normal calculations are exercised.",
-        "C6": "Primary related-work comparison was source-audited (an asymptotic claim, not a timing benchmark).",
+        "C1": "SOURCE_AUDITED_CONDITIONAL: Theorem 3.1 was source-audited; full source simulation is preserved.",
+        "C2": "SOURCE_AUDITED_CONDITIONAL: the three stated assumptions were audited against the primary source and CPU configuration.",
+        "C3": "REPRODUCED_SCOPED: independent positive-only recovery passes and a disjoint-reference control fails strongly.",
+        "C4": "REPRODUCED_SCOPED: pinned full Phase-I/II source run beats OLS and wrong-set PSGD; independent likelihood control agrees.",
+        "C5": "SOURCE_AUDITED_CONDITIONAL: primary smoothness lemma was source-audited; independent conditional-normal calculations are exercised.",
+        "C6": "SOURCE_AUDITED_ONLY: primary related-work comparison was source-audited (an asymptotic claim, not a timing benchmark).",
     }
     report = {
         "paper": "DsV89lJ58l",
+        "arxiv": "2602.12534",
+        "status": "INCONCLUSIVE" if not failures else "GATE_FAILED",
+        "scoped_gate_passed": not failures,
         "pass": not failures,
         "tests_passed": tests_passed,
         "publication_gate_passed": not failures,
+        "paper_claims_total": 6,
+        "paper_claims_verified": 0,
         "author_commit": commit,
         "author_dirty": bool(dirty),
         "full_scale": {"reruns": 10, "psgd_iterations": 4500, "plot": str(plot.relative_to(ROOT))},
@@ -97,8 +102,25 @@ def main() -> None:
             "full_algorithm_mean_error": 0.653189,
         },
         "independent_controls": independent,
+        "current_claim_status": {
+            "C1": "SOURCE_AUDITED_CONDITIONAL",
+            "C2": "SOURCE_AUDITED_CONDITIONAL",
+            "C3": "REPRODUCED_SCOPED",
+            "C4": "REPRODUCED_SCOPED",
+            "C5": "SOURCE_AUDITED_CONDITIONAL",
+            "C6": "SOURCE_AUDITED_ONLY",
+        },
+        "claim_confidence": {
+            "C1": "MEDIUM",
+            "C2": "MEDIUM",
+            "C3": "MEDIUM",
+            "C4": "MEDIUM/HIGH",
+            "C5": "MEDIUM",
+            "C6": "LOW",
+        },
         "claims": claims,
         "failures": failures,
+        "status_note": "This is a scoped documentation/evidence gate; no universal paper claim is independently formalized.",
     }
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
